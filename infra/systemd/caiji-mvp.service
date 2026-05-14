@@ -1,6 +1,6 @@
 [Unit]
 Description=caiji-mvp - QQ 群消息采集 FastAPI 服务
-Documentation=https://github.com/jinlunhuang67-art/caiji-mvp
+Documentation=https://github.com/l6444585-afk/caiji-mvp
 After=network.target
 
 [Service]

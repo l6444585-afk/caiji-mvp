@@ -28,25 +28,45 @@ SYSTEMD_UNIT_LOCAL="$(cd "$(dirname "$0")/.." && pwd)/systemd/caiji-mvp.service"
 ENV_FILE_LOCAL="$(cd "$(dirname "$0")/../.." && pwd)/.env"
 ENV_FILE_REMOTE="/etc/caiji-mvp.env"
 
-# ============ Step 1: 拉取代码 + 装依赖 ============
+# ============ Step 1: 拉取代码 (本地 tar→base64 直推, 绕开 GitHub) + 装依赖 ============
+# 旧版用 `git fetch origin main` 但阿里云杭州→github 网络偶发 HTTP/2 framing 错误导致 fetch
+# 静默失败但 set -e 不退出 (`git fetch --all` 部分失败仍返回 0), 服务器代码不更新.
+# 新版: 本地 `git ls-files` 拿到全部 git 跟踪文件, tar+base64 通过 RunCommand 直推, 100% 可靠.
 deploy_code_and_deps() {
-  echo "==> Step 1: git clone/pull + 装 Python venv + 依赖"
+  echo "==> Step 1: 本地 tar→base64 推代码 + 装 Python venv + 依赖"
+  local repo_root="$(cd "$(dirname "$0")/../.." && pwd)"
+  # 列出 git 跟踪的所有文件 (排除 .gitignore 里的 .env / data/ / .venv 等)
+  local tar_b64
+  tar_b64=$(cd "$repo_root" && git ls-files -z | xargs -0 tar czf - 2>/dev/null | base64 | tr -d '\n')
+  if [ -z "$tar_b64" ]; then
+    echo "!!! tar 失败, 检查 git ls-files: $(cd "$repo_root" && git ls-files | wc -l) 个文件"
+    exit 1
+  fi
+  echo "    本地代码包 base64 大小: ${#tar_b64} bytes"
   local script
   script=$(cat <<SHELL
 set -e
 mkdir -p $DEPLOY_DIR
-if [ -d $DEPLOY_DIR/.git ]; then
-  cd $DEPLOY_DIR && git fetch --all && git reset --hard origin/main
-else
-  git clone $REPO_URL $DEPLOY_DIR
-fi
 cd $DEPLOY_DIR
+# 首次部署: 先 git clone 拿到 .git 目录 (为了 git log/blame 可追溯版本)
+if [ ! -d $DEPLOY_DIR/.git ]; then
+  git clone $REPO_URL $DEPLOY_DIR.tmp || (echo "!!! 首次 git clone 失败, fallback 到只解压代码"; mkdir -p $DEPLOY_DIR)
+  if [ -d $DEPLOY_DIR.tmp/.git ]; then
+    mv $DEPLOY_DIR.tmp/.git $DEPLOY_DIR/
+    rm -rf $DEPLOY_DIR.tmp
+  fi
+fi
+# 推送的代码 tar 解压覆盖
+echo "$tar_b64" | base64 -d | tar xzf - -C $DEPLOY_DIR
+# venv + 依赖
 apt-get install -y -qq python3-venv python3-pip
 [ ! -d .venv ] && python3 -m venv .venv
 .venv/bin/pip install --quiet --upgrade pip
 .venv/bin/pip install --quiet -r requirements.txt
 echo "✅ 代码同步 + 依赖装好"
-.venv/bin/python -c "import fastapi; import uvicorn; print('FastAPI', fastapi.__version__, 'uvicorn', uvicorn.__version__)"
+.venv/bin/python -c "import fastapi; import uvicorn; import httpx; print('FastAPI', fastapi.__version__, 'uvicorn', uvicorn.__version__, 'httpx', httpx.__version__)"
+echo "=== 推送的文件清单 (前 20) ==="
+ls -la $DEPLOY_DIR/server.py $DEPLOY_DIR/parser.py $DEPLOY_DIR/tests/ 2>&1 | head -20
 SHELL
   )
   invoke_remote "$script"
@@ -231,9 +251,11 @@ SHELL
 }
 
 # ============ Helper: 远程执行 ============
+# 修复: 完整状态枚举 (Finished/Failed/Cancelled/Timeout/PartialFailed) 都退出 polling,
+# 否则 Failed 时旧版死循环 polling 直到外层 Bash 超时, 不显示真实错误.
 invoke_remote() {
   local script="$1"
-  local b64 invoke_id status
+  local b64 invoke_id status exit_code
   b64=$(printf '%s' "$script" | base64)
   invoke_id=$(aliyun ecs RunCommand --RegionId "$REGION" \
     --InstanceId.1 "$INSTANCE_ID" \
@@ -243,17 +265,23 @@ invoke_remote() {
     --Timeout 900 \
     --cli-query 'InvokeId' | tr -d '"')
   echo "InvokeId=$invoke_id"
-  until [ "$(aliyun ecs DescribeInvocations --RegionId "$REGION" --InvokeId "$invoke_id" --cli-query 'Invocations.Invocation[0].InvokeStatus' | tr -d '"')" = "Finished" ]; do
-    sleep 5
+  status=""
+  for i in $(seq 1 300); do
+    status=$(aliyun ecs DescribeInvocations --RegionId "$REGION" --InvokeId "$invoke_id" --cli-query 'Invocations.Invocation[0].InvokeStatus' | tr -d '"')
+    case "$status" in
+      Finished|Failed|Cancelled|Timeout|PartialFailed) break ;;
+    esac
+    sleep 3
   done
+  echo "[remote status=$status]"
   aliyun ecs DescribeInvocationResults --RegionId "$REGION" --InvokeId "$invoke_id" \
     --cli-query 'Invocation.InvocationResults.InvocationResult[0].Output' \
     | tr -d '"' | base64 -d
-  status=$(aliyun ecs DescribeInvocationResults --RegionId "$REGION" --InvokeId "$invoke_id" \
+  exit_code=$(aliyun ecs DescribeInvocationResults --RegionId "$REGION" --InvokeId "$invoke_id" \
     --cli-query 'Invocation.InvocationResults.InvocationResult[0].ExitCode')
-  if [ "$status" != "0" ]; then
-    echo "!!! ExitCode=$status, aborting"
-    exit "$status"
+  if [ "$exit_code" != "0" ] || [ "$status" != "Finished" ]; then
+    echo "!!! ExitCode=$exit_code Status=$status, aborting"
+    exit 1
   fi
 }
 

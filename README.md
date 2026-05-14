@@ -35,8 +35,24 @@ bash infra/scripts/provision.sh all       # 全流程（首次部署）
 cd /Users/tkag/Projects/caiji-mvp
 source .venv/bin/activate
 pip install -r requirements.txt
-python -m uvicorn server:app --host 127.0.0.1 --port 8090 --reload
+# 生成本地 secret (一次)
+python3 -c "import secrets; print('CAIJI_SECRET=' + secrets.token_urlsafe(32))" > .env
+# 加载 env 后启动
+export $(grep -v '^#' .env | xargs) && python -m uvicorn server:app --host 127.0.0.1 --port 8090 --reload
 ```
+
+环境变量（参考 `.env.example`）：
+
+| 变量 | 用途 | 是否必填 |
+|---|---|---|
+| `CAIJI_SECRET` | OneBot 11 X-Signature HMAC-SHA1 验签密钥，与 NapCat 客户端 Secret 字段对应 | **生产必填**；本地开发未设为空时跳过验签 |
+
+## 安全
+
+- 接收端验签：`/onebot/event` 强制要求 `X-Signature: sha1=<HMAC-SHA1(secret, body)>`，错误/缺失返回 401（仅生产模式）
+- 协议参考：[OneBot 11 HTTP](https://github.com/botuniverse/onebot-11/blob/master/communication/http.md)
+- Secret 存放：本地 `.env`（gitignored），服务器 `/etc/caiji-mvp.env`（chmod 600 root-only，systemd `EnvironmentFile=` 加载）
+- NEVER 把 secret 写进代码/commit/截图/聊天群
 
 ## 接口
 
