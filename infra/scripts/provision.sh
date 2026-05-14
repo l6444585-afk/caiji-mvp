@@ -7,6 +7,7 @@
 #   bash infra/scripts/provision.sh           # 全流程
 #   bash infra/scripts/provision.sh code      # 仅同步代码 (git pull)
 #   bash infra/scripts/provision.sh deps      # 仅装依赖
+#   bash infra/scripts/provision.sh secret    # 仅同步 .env (CAIJI_SECRET) 到 /etc/caiji-mvp.env
 #   bash infra/scripts/provision.sh service   # 仅写 systemd + 启动服务
 #   bash infra/scripts/provision.sh nginx     # 仅配 nginx
 #   bash infra/scripts/provision.sh cert      # 仅申请 SSL 证书
@@ -24,6 +25,8 @@ DEPLOY_DIR="/opt/fengyun/caiji-mvp"
 NGINX_CONF_REMOTE="/etc/nginx/sites-available/caiji"
 NGINX_CONF_LOCAL="$(cd "$(dirname "$0")/.." && pwd)/nginx/caiji.conf"
 SYSTEMD_UNIT_LOCAL="$(cd "$(dirname "$0")/.." && pwd)/systemd/caiji-mvp.service"
+ENV_FILE_LOCAL="$(cd "$(dirname "$0")/../.." && pwd)/.env"
+ENV_FILE_REMOTE="/etc/caiji-mvp.env"
 
 # ============ Step 1: 拉取代码 + 装依赖 ============
 deploy_code_and_deps() {
@@ -44,6 +47,33 @@ apt-get install -y -qq python3-venv python3-pip
 .venv/bin/pip install --quiet -r requirements.txt
 echo "✅ 代码同步 + 依赖装好"
 .venv/bin/python -c "import fastapi; import uvicorn; print('FastAPI', fastapi.__version__, 'uvicorn', uvicorn.__version__)"
+SHELL
+  )
+  invoke_remote "$script"
+}
+
+# ============ Step 1.5: 同步 secret 到 /etc/caiji-mvp.env (chmod 600) ============
+provision_secret() {
+  echo "==> Step 1.5: 同步本地 .env → 服务器 $ENV_FILE_REMOTE (chmod 600)"
+  if [ ! -f "$ENV_FILE_LOCAL" ]; then
+    echo "!!! 本地 .env 不存在: $ENV_FILE_LOCAL"
+    echo "    生成命令:"
+    echo "      python3 -c 'import secrets; print(\"CAIJI_SECRET=\" + secrets.token_urlsafe(32))' > $ENV_FILE_LOCAL"
+    exit 1
+  fi
+  local env_b64
+  env_b64=$(base64 < "$ENV_FILE_LOCAL" | tr -d '\n')
+  local script
+  script=$(cat <<SHELL
+set -e
+echo "$env_b64" | base64 -d > $ENV_FILE_REMOTE
+chmod 600 $ENV_FILE_REMOTE
+chown root:root $ENV_FILE_REMOTE
+echo "=== $ENV_FILE_REMOTE 已写入 (chmod 600) ==="
+ls -la $ENV_FILE_REMOTE
+# 只打印 key 名, 不打印 secret 值, 避免泄漏到日志
+echo "=== 配置的环境变量 (value 已隐藏) ==="
+grep -E '^[A-Z_]+=' $ENV_FILE_REMOTE | sed 's/=.*\$/=<hidden>/'
 SHELL
   )
   invoke_remote "$script"
@@ -160,25 +190,38 @@ SHELL
 
 # ============ Step 6: 验证 ============
 verify() {
-  echo "==> Step 6: 验证 HTTPS / 服务 / 端到端"
+  echo "==> Step 6: 验证 HTTPS / 服务 / 端到端 (含验签)"
   local script
   script=$(cat <<SHELL
+set -e
+. $ENV_FILE_REMOTE
 echo "=== 服务状态 ==="
 systemctl is-active caiji-mvp
 echo "=== 端口监听 ==="
 ss -tlnp | grep 8090
-echo "=== HTTPS 健康检查 ==="
+echo "=== HTTPS 健康检查 (GET /) ==="
 curl -sS https://$DOMAIN/ | head -c 300
 echo ""
 echo "=== TLS handshake ==="
 echo Q | openssl s_client -connect $DOMAIN:443 -servername $DOMAIN 2>&1 | grep -E 'subject=|issuer=|Protocol' | head -5
-echo "=== 模拟 NapCat 上报 ==="
+
+echo "=== 安全验签 1/2: 无 X-Signature, 预期 401 ==="
 curl -sS -X POST https://$DOMAIN/onebot/event \\
   -H "Content-Type: application/json" \\
-  -d '{"self_id":100,"user_id":1,"message_type":"group","sub_type":"normal","sender":{"nickname":"test"},"raw_message":"测试消息 9.9元 (testToken123) HU1234","post_type":"message","group_id":999,"group_name":"测试群"}' | head -c 200
-echo ""
+  -d '{"test":"no-sig-should-fail"}' \\
+  -w "\\n[HTTP %{http_code}]\\n"
+
+echo "=== 安全验签 2/2: 带正确 HMAC-SHA1 X-Signature, 预期 200 ==="
+BODY='{"self_id":100,"user_id":1,"message_type":"group","sub_type":"normal","sender":{"nickname":"verify-bot"},"raw_message":"验证 9.9元 (verifyToken) HU9999","post_type":"message","group_id":999,"group_name":"verify-group"}'
+SIG="sha1=\$(printf '%s' "\$BODY" | openssl dgst -sha1 -hmac "\$CAIJI_SECRET" | awk '{print \$2}')"
+curl -sS -X POST https://$DOMAIN/onebot/event \\
+  -H "Content-Type: application/json" \\
+  -H "X-Signature: \$SIG" \\
+  -d "\$BODY" \\
+  -w "\\n[HTTP %{http_code}]\\n"
+
 echo "=== 最近 5 条采集 ==="
-curl -sS https://$DOMAIN/recent?limit=5 | head -c 500
+curl -sS https://$DOMAIN/recent?limit=5 | head -c 600
 echo ""
 echo "=== 续期机制 ==="
 systemctl is-enabled certbot.timer
@@ -218,6 +261,7 @@ invoke_remote() {
 case "${1:-all}" in
   code)     deploy_code_and_deps ;;
   deps)     deploy_code_and_deps ;;
+  secret)   provision_secret ;;
   service)  setup_systemd ;;
   nginx)    setup_nginx ;;
   cert)     provision_cert ;;
@@ -225,6 +269,7 @@ case "${1:-all}" in
   verify)   verify ;;
   all)
     deploy_code_and_deps
+    provision_secret
     setup_systemd
     setup_nginx
     provision_cert
@@ -232,7 +277,7 @@ case "${1:-all}" in
     verify
     ;;
   *)
-    echo "Usage: $0 [code|service|nginx|cert|hardened|verify|all]"
+    echo "Usage: $0 [code|deps|secret|service|nginx|cert|hardened|verify|all]"
     exit 1
     ;;
 esac

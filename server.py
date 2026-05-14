@@ -1,7 +1,10 @@
 """FastAPI 接收端：监听 NapCat OneBot 11 HTTP 上报."""
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
+import os
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -17,6 +20,33 @@ app = FastAPI(title="caiji-mvp", description="QQ 群消息采集 MVP")
 DATA_DIR = Path(__file__).parent / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 JSONL_PATH = DATA_DIR / "messages.jsonl"
+
+
+def _get_secret() -> str:
+    """请求时读 CAIJI_SECRET 环境变量, 未配置则为空 (仅限本地开发)."""
+    return os.environ.get("CAIJI_SECRET", "")
+
+
+def verify_onebot_signature(body: bytes, x_signature: str) -> None:
+    """OneBot 11 X-Signature HMAC-SHA1 验签.
+
+    协议: https://github.com/botuniverse/onebot-11/blob/master/communication/http.md
+    Header 格式: X-Signature: sha1=<lowercase hex of HMAC-SHA1(secret, body)>
+    """
+    secret = _get_secret()
+    if not secret:
+        return
+    if not x_signature or not x_signature.startswith("sha1="):
+        raise HTTPException(
+            status_code=401, detail="Missing or invalid X-Signature header"
+        )
+    expected = hmac.new(
+        secret.encode("utf-8"),
+        body,
+        hashlib.sha1,
+    ).hexdigest()
+    if not hmac.compare_digest(x_signature[5:], expected):
+        raise HTTPException(status_code=401, detail="X-Signature mismatch")
 
 
 def log_to_jsonl(payload: dict[str, Any]) -> None:
@@ -90,10 +120,14 @@ async def root() -> dict[str, str]:
 
 @app.post("/onebot/event")
 async def onebot_event(request: Request) -> JSONResponse:
+    body = await request.body()
+    verify_onebot_signature(body, request.headers.get("x-signature", ""))
     try:
-        payload = await request.json()
+        payload = json.loads(body)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid JSON: {e}") from e
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Payload must be JSON object")
 
     log_to_jsonl(payload)
     message_id = save_to_db(payload)

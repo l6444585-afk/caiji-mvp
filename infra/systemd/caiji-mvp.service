@@ -8,6 +8,7 @@ Type=exec
 User=root
 WorkingDirectory=/opt/fengyun/caiji-mvp
 Environment="PATH=/opt/fengyun/caiji-mvp/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+EnvironmentFile=/etc/caiji-mvp.env
 ExecStart=/opt/fengyun/caiji-mvp/.venv/bin/python -m uvicorn server:app --host 127.0.0.1 --port 8090
 Restart=always
 RestartSec=3
