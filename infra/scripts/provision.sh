@@ -80,30 +80,35 @@ setup_nginx() {
   local conf_b64
   conf_b64=$(base64 < "$NGINX_CONF_LOCAL" | tr -d '\n')
   # 首次部署只配 HTTP 80, certbot 之后会自动加 443
+  # 注意 nginx 变量 \$host \$remote_addr 必须保留，shell 变量 $DOMAIN 展开
   local script
   script=$(cat <<SHELL
 set -e
 # 临时配置只监听 80 (certbot 会改造成 443)
-cat > $NGINX_CONF_REMOTE <<'NGINX_EOF'
+# 用占位符 + sed 替换，避免 heredoc 引号陷阱
+cat > /tmp/caiji.nginx.template <<'NGINX_EOF'
 server {
     listen 80;
-    server_name $DOMAIN;
+    server_name __DOMAIN__;
     location /onebot/event {
         proxy_pass http://127.0.0.1:8090/onebot/event;
-        proxy_set_header Host \\\$host;
-        proxy_set_header X-Real-IP \\\$remote_addr;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
         client_max_body_size 5M;
     }
     location / {
         proxy_pass http://127.0.0.1:8090;
-        proxy_set_header Host \\\$host;
-        proxy_set_header X-Real-IP \\\$remote_addr;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
     }
 }
 NGINX_EOF
+sed "s/__DOMAIN__/$DOMAIN/g" /tmp/caiji.nginx.template > $NGINX_CONF_REMOTE
 ln -sf $NGINX_CONF_REMOTE /etc/nginx/sites-enabled/caiji
 nginx -t
 systemctl reload nginx
+echo "--- 实际写入的配置（前 10 行）---"
+head -10 $NGINX_CONF_REMOTE
 echo "✅ nginx caiji server block (HTTP) 已加"
 curl -sS -H "Host: $DOMAIN" http://127.0.0.1/ | head -c 200
 SHELL
