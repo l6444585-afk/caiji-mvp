@@ -1,10 +1,12 @@
 """FastAPI 接收端：监听 NapCat OneBot 11 HTTP 上报."""
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import json
 import os
+from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -14,8 +16,28 @@ from fastapi.responses import JSONResponse
 
 from db import DB_PATH, get_conn
 from parser import parse_message
+from sync import sync_loop
 
-app = FastAPI(title="caiji-mvp", description="QQ 群消息采集 MVP")
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    """启动 caiji → zhaoshang sync worker (后台 async task)."""
+    sync_task = asyncio.create_task(sync_loop())
+    try:
+        yield
+    finally:
+        sync_task.cancel()
+        try:
+            await sync_task
+        except asyncio.CancelledError:
+            pass
+
+
+app = FastAPI(
+    title="caiji-mvp",
+    description="QQ 群消息采集 MVP",
+    lifespan=lifespan,
+)
 
 DATA_DIR = Path(__file__).parent / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
