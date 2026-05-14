@@ -27,49 +27,74 @@ NGINX_CONF_LOCAL="$(cd "$(dirname "$0")/.." && pwd)/nginx/caiji.conf"
 SYSTEMD_UNIT_LOCAL="$(cd "$(dirname "$0")/.." && pwd)/systemd/caiji-mvp.service"
 ENV_FILE_LOCAL="$(cd "$(dirname "$0")/../.." && pwd)/.env"
 ENV_FILE_REMOTE="/etc/caiji-mvp.env"
+# OSS 中转 bucket (cn-hangzhou, 跟 ECS 同 region 走内网下载 0 流量费)
+OSS_BUCKET="caiji-deploy-hz"
+OSS_ENDPOINT_PUBLIC="oss-cn-hangzhou.aliyuncs.com"
+OSS_ENDPOINT_INTERNAL="oss-cn-hangzhou-internal.aliyuncs.com"
 
-# ============ Step 1: 拉取代码 (本地 tar→base64 直推, 绕开 GitHub) + 装依赖 ============
-# 旧版用 `git fetch origin main` 但阿里云杭州→github 网络偶发 HTTP/2 framing 错误导致 fetch
-# 静默失败但 set -e 不退出 (`git fetch --all` 部分失败仍返回 0), 服务器代码不更新.
-# 新版: 本地 `git ls-files` 拿到全部 git 跟踪文件, tar+base64 通过 RunCommand 直推, 100% 可靠.
+# ============ Step 1: 拉取代码 (本地 tar→OSS→ECS 内网拉) + 装依赖 ============
+# 教训演进 (2026-05-14):
+# v1 (失败): git fetch origin main → 阿里云→GitHub HTTP/2 framing 偶发失败, set -e 不退出
+# v2 (失败): tar+base64 嵌进 RunCommand 脚本 → 撞 RunCommand 16KB 上限 (commit content 限制)
+# v3 (当前): tar→OSS bucket (cn-hangzhou) → 内网 signed URL → RunCommand curl 下载解压
+#   优点: ① 完全绕 GitHub ② 不撞 RunCommand 16KB 限制 (URL ~ 500 bytes)
+#         ③ 内网下载零流量费 + 速度 100MB/s ④ OSS 文件保留 7 天可审计
 deploy_code_and_deps() {
-  echo "==> Step 1: 本地 tar→base64 推代码 + 装 Python venv + 依赖"
+  echo "==> Step 1: 本地 tar → OSS (${OSS_BUCKET}) → ECS 内网拉 + 装依赖"
   local repo_root="$(cd "$(dirname "$0")/../.." && pwd)"
-  # 列出 git 跟踪的所有文件 (排除 .gitignore 里的 .env / data/ / .venv 等)
-  local tar_b64
-  tar_b64=$(cd "$repo_root" && git ls-files -z | xargs -0 tar czf - 2>/dev/null | base64 | tr -d '\n')
-  if [ -z "$tar_b64" ]; then
-    echo "!!! tar 失败, 检查 git ls-files: $(cd "$repo_root" && git ls-files | wc -l) 个文件"
+  local ts
+  ts=$(date +%s)
+  local tar_path="/tmp/caiji-deploy-${ts}.tar.gz"
+  local oss_key="caiji-deploy/${ts}.tar.gz"
+
+  # 1. 本地打包 git 跟踪的所有文件
+  (cd "$repo_root" && git ls-files -z | xargs -0 tar czf "$tar_path")
+  echo "    tar size: $(wc -c < "$tar_path") bytes"
+
+  # 2. 上传到 OSS (cn-hangzhou)
+  if ! aliyun oss cp "$tar_path" "oss://${OSS_BUCKET}/${oss_key}" \
+       --endpoint "$OSS_ENDPOINT_PUBLIC" --force >/dev/null 2>&1; then
+    echo "!!! OSS upload failed; 检查 bucket '$OSS_BUCKET' 是否存在 + aliyun oss 凭证"
+    rm -f "$tar_path"
     exit 1
   fi
-  echo "    本地代码包 base64 大小: ${#tar_b64} bytes"
+  echo "    uploaded to oss://${OSS_BUCKET}/${oss_key}"
+
+  # 3. 生成预签名 URL (1h, internal endpoint 让 ECS 走内网)
+  local dl_url sign_out
+  sign_out=$(aliyun oss sign "oss://${OSS_BUCKET}/${oss_key}" \
+             --timeout 3600 --endpoint "$OSS_ENDPOINT_INTERNAL" 2>&1)
+  dl_url=$(echo "$sign_out" | grep '^http' | head -1)
+  if [ -z "$dl_url" ] || [ "${#dl_url}" -lt 50 ]; then
+    echo "!!! signed URL 提取失败; sign output: $sign_out"
+    rm -f "$tar_path"
+    exit 1
+  fi
+
+  # 4. RunCommand: 服务器 curl + 解压 + 装依赖
   local script
   script=$(cat <<SHELL
 set -e
 mkdir -p $DEPLOY_DIR
 cd $DEPLOY_DIR
-# 首次部署: 先 git clone 拿到 .git 目录 (为了 git log/blame 可追溯版本)
-if [ ! -d $DEPLOY_DIR/.git ]; then
-  git clone $REPO_URL $DEPLOY_DIR.tmp || (echo "!!! 首次 git clone 失败, fallback 到只解压代码"; mkdir -p $DEPLOY_DIR)
-  if [ -d $DEPLOY_DIR.tmp/.git ]; then
-    mv $DEPLOY_DIR.tmp/.git $DEPLOY_DIR/
-    rm -rf $DEPLOY_DIR.tmp
-  fi
-fi
-# 推送的代码 tar 解压覆盖
-echo "$tar_b64" | base64 -d | tar xzf - -C $DEPLOY_DIR
-# venv + 依赖
+echo "=== OSS 内网下载 ==="
+curl -fsSL "$dl_url" -o /tmp/caiji-deploy.tar.gz
+tar xzf /tmp/caiji-deploy.tar.gz -C $DEPLOY_DIR
+rm /tmp/caiji-deploy.tar.gz
+echo "=== 装/升依赖 ==="
 apt-get install -y -qq python3-venv python3-pip
 [ ! -d .venv ] && python3 -m venv .venv
 .venv/bin/pip install --quiet --upgrade pip
 .venv/bin/pip install --quiet -r requirements.txt
 echo "✅ 代码同步 + 依赖装好"
 .venv/bin/python -c "import fastapi; import uvicorn; import httpx; print('FastAPI', fastapi.__version__, 'uvicorn', uvicorn.__version__, 'httpx', httpx.__version__)"
-echo "=== 推送的文件清单 (前 20) ==="
-ls -la $DEPLOY_DIR/server.py $DEPLOY_DIR/parser.py $DEPLOY_DIR/tests/ 2>&1 | head -20
+ls -la server.py parser.py db.py sync.py 2>&1 | head -10
 SHELL
   )
   invoke_remote "$script"
+
+  # 5. 本地清理 tar (OSS 上保留, 可在 OSS console 配 lifecycle rule 7 天后自动删)
+  rm -f "$tar_path"
 }
 
 # ============ Step 1.5: 同步 secret 到 /etc/caiji-mvp.env (chmod 600) ============

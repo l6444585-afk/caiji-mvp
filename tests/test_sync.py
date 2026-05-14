@@ -244,3 +244,78 @@ def test_payload_shape():
     assert p["parsed_price"] == 19.9
     assert p["product_name"] == "名字"
     assert "feed_id" not in p
+
+
+OLD_SCHEMA_BEFORE_SYNC = """
+CREATE TABLE messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    received_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+    self_id TEXT, user_id TEXT, group_id TEXT, group_name TEXT,
+    sender_nickname TEXT, sender_card TEXT, sender_role TEXT,
+    message_type TEXT, sub_type TEXT, raw_message TEXT,
+    payload_json TEXT NOT NULL
+);
+CREATE TABLE feeds (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    message_id INTEGER NOT NULL,
+    parsed_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+    price REAL, product_name TEXT, taobao_token TEXT,
+    coupon_code TEXT, quantity INTEGER, raw_message TEXT,
+    FOREIGN KEY (message_id) REFERENCES messages(id)
+);
+"""
+
+
+def test_migration_from_old_schema_adds_sync_columns():
+    """老 DB (无 sync_* 列) + 新代码 get_conn → 自动 ALTER 加列 + 索引.
+
+    回归测试 (2026-05-14): 第一版 SCHEMA 把 idx_feeds_sync 放在 CREATE INDEX 段,
+    老 DB 上 executescript 撞 'no such column: sync_status' 全事务回滚,
+    FastAPI 上线立刻 500. 把索引挪进 MIGRATIONS 修复.
+    """
+    import sqlite3
+    import tempfile
+    tmp = Path(tempfile.mkdtemp()) / "old_schema.db"
+    raw = sqlite3.connect(tmp)
+    raw.executescript(OLD_SCHEMA_BEFORE_SYNC)
+    raw.commit()
+    raw.close()
+
+    saved_path = db.DB_PATH
+    db.DB_PATH = tmp
+    try:
+        conn = db.get_conn()
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(feeds)")]
+        conn.close()
+    finally:
+        db.DB_PATH = saved_path
+
+    for c in ("sync_status", "sync_attempts", "synced_at", "last_sync_error"):
+        assert c in cols, f"migration 未加列 {c}, 当前列: {cols}"
+
+    raw2 = sqlite3.connect(tmp)
+    cols2 = [r[1] for r in raw2.execute("PRAGMA table_info(feeds)")]
+    idxs = [r[1] for r in raw2.execute("PRAGMA index_list(feeds)")]
+    raw2.close()
+    assert "sync_status" in cols2, "迁移没持久化到磁盘"
+    assert "idx_feeds_sync" in idxs, f"sync 索引未创建, 现有: {idxs}"
+
+
+def test_migration_idempotent():
+    """连续调 get_conn 三次, migrations 不抛 (duplicate column / already exists 都吞掉)."""
+    import sqlite3
+    import tempfile
+    tmp = Path(tempfile.mkdtemp()) / "idempotent.db"
+    raw = sqlite3.connect(tmp)
+    raw.executescript(OLD_SCHEMA_BEFORE_SYNC)
+    raw.commit()
+    raw.close()
+
+    saved_path = db.DB_PATH
+    db.DB_PATH = tmp
+    try:
+        for _ in range(3):
+            c = db.get_conn()
+            c.close()
+    finally:
+        db.DB_PATH = saved_path
